@@ -36,6 +36,8 @@ MR_DB = "/tmp/ga5_mailroom.sqlite3"
 MR_LOCK = threading.Lock()
 Q10_TASKS = {}
 Q11_RUNS = {}
+Q11_DIGESTS = {}
+Q10_LOCK = threading.Lock()
 app = FastAPI(docs_url=None, redoc_url=None)
 
 
@@ -526,12 +528,16 @@ async def a2a_send(request: Request):
     message_id = message.get("messageId")
     if not isinstance(message_id, str): raise HTTPException(422, "messageId required")
     key = (principal, message_id)
-    if key in Q10_TASKS: return a2a_json({"task": Q10_TASKS[key]["task"]})
+    if key in Q10_TASKS:
+        if Q10_TASKS[key]["message_digest"] != digest(message):
+            raise HTTPException(409, "IDEMPOTENCY_CONFLICT")
+        return a2a_json({"task": Q10_TASKS[key]["task"]})
     parts = message.get("parts", [])
     result_part = next((p for p in parts if p.get("mediaType") == "application/vnd.ga5.invoice-action-results+json"), None)
     if result_part:
         task_id = message.get("taskId"); existing = next((v for v in Q10_TASKS.values() if v["principal"] == principal and v["task"]["id"] == task_id), None)
         if not existing: raise HTTPException(404, "Task not found")
+        if existing["task"]["status"]["state"] != "TASK_STATE_INPUT_REQUIRED": raise HTTPException(409, "Task is terminal")
         results = result_part.get("data", {}).get("results", []); prop = existing["proposals"]
         by_id = {p["packageId"]:p for p in prop["proposals"]}; executions=[]
         for r in results:
@@ -548,7 +554,7 @@ async def a2a_send(request: Request):
         text=compact_json(package); refs=re.findall(r"\[([^\]]+)\]", text)[:3]
         proposals.append({"packageId":pid,"actionId":"act_"+hashlib.sha256(text.encode()).hexdigest()[:20],"action":"open_exception","facts":{"vendorName":"","invoiceNumber":"","amountMinor":0,"currency":"INR"},"evidenceRefs":refs[:3],"rationale":"open_exception requires review because the invoice package must be reconciled against authoritative records."})
     prop={"batchId":batch.get("batchId"),"proposals":proposals}; tid="task_"+uuid.uuid4().hex; task=invoice_task(tid,"ctx_"+uuid.uuid4().hex,message,prop)
-    Q10_TASKS[key]={"principal":principal,"task":task,"proposals":prop}; return a2a_json({"task":task})
+    Q10_TASKS[key]={"principal":principal,"task":task,"proposals":prop,"message_digest":digest(message)}; return a2a_json({"task":task})
 
 
 @app.get("/a2a/tasks")
@@ -579,11 +585,14 @@ async def create_incident(request: Request):
     data=await body(request)
     if data.get("profile")!="ga5-incident-agent/v2": raise HTTPException(422,"Unsupported profile")
     run_id=data.get("runId"); incident=data.get("incident",{}); catalog=data.get("toolCatalog",[])
-    if run_id in Q11_RUNS: return Q11_RUNS[run_id]
+    incoming_digest=digest(data)
+    if run_id in Q11_RUNS:
+        if Q11_DIGESTS.get(run_id) != incoming_digest: raise HTTPException(409,"Run ID content conflict")
+        return Q11_RUNS[run_id]
     root=(incident.get("allowedRootCauses") or [""])[0]; evidence=incident_evidence(incident.get("transcript", "")); diagnostic=next((x for x in catalog if x.get("name") not in data.get("policy",{}).get("effectTools",[])), None)
     trace=uuid.uuid4().hex; dispatches=[]
     if diagnostic: dispatches=[{"actionId":"act_"+uuid.uuid4().hex[:16],"callId":"call_"+uuid.uuid4().hex[:16],"phase":"diagnostic","toolName":diagnostic.get("name"),"arguments":{},"evidence":evidence[:1],"attempt":1,"traceparent":"00-"+trace+"-"+uuid.uuid4().hex[:16]+"-01"}]
-    result={"runId":run_id,"status":"waiting","diagnosis":{"rootCause":root,"evidence":evidence},"dispatches":dispatches,"approvals":[]}; Q11_RUNS[run_id]=result; return result
+    result={"runId":run_id,"status":"waiting","diagnosis":{"rootCause":root,"evidence":evidence},"dispatches":dispatches,"approvals":[]}; Q11_RUNS[run_id]=result; Q11_DIGESTS[run_id]=incoming_digest; return result
 
 
 @app.post("/v2/incidents/{run_id}/receipts")
