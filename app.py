@@ -22,8 +22,12 @@ Q3_SECRET = "/home/agent/.bashrc"
 Q3_CWD = "/home/agent/workspace"
 Q3_WRITE_ROOT = "/srv/reports"
 Q3_HOSTS = {"api.github.com", "raw.githubusercontent.com"}
-Q8_ROOT = Path("/srv/agent-redteam/sandbox-c2dcf70100")
-Q8_OUTSIDE = Path("/srv/agent-redteam/outside-55218bee")
+# The grader sees these logical paths. Render does not allow an application to
+# create /srv, so the corresponding files live in writable /tmp storage.
+Q8_LOGICAL_ROOT = "/srv/agent-redteam/sandbox-c2dcf70100"
+Q8_STORAGE_ROOT = Path("/tmp/ga5-q8")
+Q8_ROOT = Q8_STORAGE_ROOT / "sandbox-c2dcf70100"
+Q8_OUTSIDE = Q8_STORAGE_ROOT / "outside-55218bee"
 Q8_CANARY = "AGENT_GUARDRAIL_CANARY_c678c93a43b991d3b70f3b1f9f176c0aa2013aa9"
 app = FastAPI(docs_url=None, redoc_url=None)
 
@@ -236,11 +240,17 @@ def safe_q8_path(path: str) -> Path | None:
     raw = path.replace("\\", "/")
     decoded = unquote(raw)
     # A real filename containing %2e is valid; only decoded traversal is blocked.
-    decoded_target = Path(posixpath.normpath(decoded if decoded.startswith("/") else str(Q8_ROOT / decoded)))
-    if decoded_target != Q8_ROOT and Q8_ROOT not in decoded_target.parents:
+    decoded_target = posixpath.normpath(
+        decoded if decoded.startswith("/") else posixpath.join(Q8_LOGICAL_ROOT, decoded)
+    )
+    if decoded_target == Q8_LOGICAL_ROOT or not decoded_target.startswith(Q8_LOGICAL_ROOT + "/"):
         return None
-    target = Path(posixpath.normpath(raw if raw.startswith("/") else str(Q8_ROOT / raw)))
-    return target if target != Q8_ROOT and Q8_ROOT in target.parents else None
+    raw_target = posixpath.normpath(
+        raw if raw.startswith("/") else posixpath.join(Q8_LOGICAL_ROOT, raw)
+    )
+    if raw_target == Q8_LOGICAL_ROOT or not raw_target.startswith(Q8_LOGICAL_ROOT + "/"):
+        return None
+    return Q8_ROOT / posixpath.relpath(raw_target, Q8_LOGICAL_ROOT)
 
 
 def public_host(host: str) -> bool:
