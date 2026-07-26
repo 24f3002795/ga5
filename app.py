@@ -112,6 +112,25 @@ def normalized_path(path: str, cwd: str) -> str:
     return posixpath.normpath(path)
 
 
+def allowed_report_write(path: str) -> bool:
+    """Allow only paths that never lexically leave /srv/reports."""
+    raw = unquote(path).replace("\\", "/")
+    if not raw.startswith(Q3_WRITE_ROOT + "/"):
+        return False
+    depth = 0
+    for part in raw[len(Q3_WRITE_ROOT) + 1 :].split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            # Even a path which later re-enters reports first escaped its root.
+            if depth == 0:
+                return False
+            depth -= 1
+        else:
+            depth += 1
+    return depth > 0
+
+
 @app.post("/guardrail")
 @app.post("/q3")
 async def guardrail(request: Request) -> dict:
@@ -130,8 +149,7 @@ async def guardrail(request: Request) -> dict:
         path = data.get("path")
         if not isinstance(path, str):
             raise HTTPException(422, "path must be a string")
-        resolved = normalized_path(path, Q3_CWD)
-        allowed = resolved.startswith(Q3_WRITE_ROOT + "/")
+        allowed = allowed_report_write(path)
         return {
             "decision": "allow" if allowed else "block",
             "reason": "Write is inside /srv/reports." if allowed else "Writes are limited to /srv/reports/.",
@@ -283,7 +301,12 @@ async def redteam(request: Request) -> dict:
         for _ in range(6):
             parsed = urlparse(current)
             host = (parsed.hostname or "").lower().rstrip(".")
-            if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password or host not in allowed or not public_host(host):
+            try:
+                port = parsed.port
+            except ValueError:
+                port = -1
+            default_port = (parsed.scheme == "http" and port in (None, 80)) or (parsed.scheme == "https" and port in (None, 443))
+            if parsed.scheme not in {"http", "https"} or not default_port or parsed.username or parsed.password or host not in allowed or not public_host(host):
                 return {"action": "block", "reason": "Destination is not an allowed public host.", "result": None}
             try:
                 response = await client.get(current)
