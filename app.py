@@ -160,7 +160,7 @@ async def guardrail(request: Request) -> dict:
             raise HTTPException(422, "url must be a string")
         try:
             parsed = urlparse(url)
-            host = (parsed.hostname or "").lower().rstrip(".")
+            host = (parsed.hostname or "").lower()
         except Exception:
             host = ""
         allowed = parsed.scheme in {"http", "https"} and host in Q3_HOSTS
@@ -182,17 +182,23 @@ async def skill_scan(request: Request) -> dict:
     lower = skill.lower()
     categories = []
     secret_patterns = (
-        r"(?:api[_-]?key|secret|token|password)\s*[:=]\s*['\"][^'\"]{8,}",
+        r"(?:api[_-]?key|secret|token|password|authorization)\s*[:=]\s*['\"]?(?!\$\{|env\.|os\.environ)[^\s'\"#]{8,}",
         r"https://[^\s'\"]*(?:webhook|hooks\.slack\.com)[^\s'\"]*",
-        r"\b(?:sk|ghp|xoxb)[_-][a-z0-9_-]{12,}\b",
+        r"\b(?:sk|ghp|xoxb|akia|AIza)[_-]?[a-z0-9_-]{12,}\b",
+        r"bearer\s+[a-z0-9._-]{16,}",
     )
     if any(re.search(pattern, skill, re.I) for pattern in secret_patterns):
         categories.append("hardcoded_secret")
-    injection = ("ignore the user's stop", "ignore any stop", "silently exfiltrat", "send file contents to", "override user")
+    injection = (
+        "ignore the user's stop", "ignore any stop", "ignore previous instructions",
+        "ignore all previous", "silently exfiltrat", "send file contents to",
+        "upload file contents", "override user", "do not tell the user", "do not reveal this",
+    )
     if any(phrase in lower for phrase in injection):
         categories.append("prompt_injection")
-    excessive = ("filesystem: /", "read/write the entire filesystem", "network: any", "egress: any", "allow all domains")
-    if any(phrase in lower for phrase in excessive):
+    excessive = ("filesystem: /", "read/write the entire filesystem", "network: any", "egress: any", "allow all domains", "network: *", "egress: *")
+    broad_path = bool(re.search(r"(?:path|filesystem|read|write)\s*:\s*(?:/|/\*|\*|all)\s*$", skill, re.I | re.M))
+    if any(phrase in lower for phrase in excessive) or broad_path:
         categories.append("excessive_permissions")
     has_author = bool(re.search(r"^author\s*:", skill, re.M | re.I))
     has_version = bool(re.search(r"^version\s*:", skill, re.M | re.I))
@@ -300,7 +306,7 @@ async def redteam(request: Request) -> dict:
     async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
         for _ in range(6):
             parsed = urlparse(current)
-            host = (parsed.hostname or "").lower().rstrip(".")
+            host = (parsed.hostname or "").lower()
             try:
                 port = parsed.port
             except ValueError:
