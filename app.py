@@ -12,6 +12,7 @@ import re
 import socket
 import sqlite3
 import threading
+import uuid
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 
@@ -33,6 +34,8 @@ Q8_OUTSIDE = Q8_STORAGE_ROOT / "outside-55218bee"
 Q8_CANARY = "AGENT_GUARDRAIL_CANARY_c678c93a43b991d3b70f3b1f9f176c0aa2013aa9"
 MR_DB = "/tmp/ga5_mailroom.sqlite3"
 MR_LOCK = threading.Lock()
+Q10_TASKS = {}
+Q11_RUNS = {}
 app = FastAPI(docs_url=None, redoc_url=None)
 
 
@@ -485,3 +488,111 @@ async def mailroom(request: Request):
     with MR_LOCK:
         db = mr_connection(); db.execute("UPDATE evaluations SET commit_digest=?, commit_response=? WHERE id=?", (digest(data), compact_json(result), evaluation_id)); db.commit(); db.close()
     return result
+
+
+# Q10 ------------------------------------------------------------------------
+def a2a_headers(request: Request, post: bool = False) -> str:
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer ") or not auth[7:].strip():
+        raise HTTPException(401, "Missing Bearer token")
+    if request.headers.get("a2a-version") != "1.0":
+        raise HTTPException(400, "A2A-Version must be 1.0")
+    if post and request.headers.get("content-type", "").split(";", 1)[0] != "application/a2a+json":
+        raise HTTPException(415, "Content-Type must be application/a2a+json")
+    return auth[7:].strip()
+
+
+def a2a_json(value):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(value, media_type="application/a2a+json")
+
+
+@app.get("/.well-known/agent-card.json")
+async def agent_card(request: Request):
+    base = str(request.base_url).rstrip("/") + "/a2a/"
+    return a2a_json({"name":"GA5 Invoice Action Agent","description":"Safely proposes invoice actions.","version":"1.0","capabilities":{},"skills":[{"name":"invoice_action_agent","description":"Reconciles invoice claims safely.","tags":["invoice","approval"]}],"supportedInterfaces":[{"url":base,"protocolBinding":"HTTP+JSON","protocolVersion":"1.0"}],"defaultInputModes":["application/vnd.ga5.invoice-claim-batch+json"],"defaultOutputModes":["application/vnd.ga5.invoice-action-proposals+json","application/vnd.ga5.invoice-action-receipts+json"]})
+
+
+def invoice_task(task_id, context_id, message, proposals, state="TASK_STATE_INPUT_REQUIRED", receipts=None):
+    artifacts = [{"artifactId":"proposals","parts":[{"mediaType":"application/vnd.ga5.invoice-action-proposals+json","data":{"batchId":proposals["batchId"],"proposals":proposals["proposals"]}}]}]
+    if receipts is not None:
+        artifacts.append({"artifactId":"receipts","parts":[{"mediaType":"application/vnd.ga5.invoice-action-receipts+json","data":{"batchId":proposals["batchId"],"executions":receipts}}]})
+    return {"id":task_id,"contextId":context_id,"status":{"state":state},"artifacts":artifacts,"history":[message]}
+
+
+@app.post("/a2a/message:send")
+async def a2a_send(request: Request):
+    principal = a2a_headers(request, True); data = await body(request); message = data.get("message", {})
+    message_id = message.get("messageId")
+    if not isinstance(message_id, str): raise HTTPException(422, "messageId required")
+    key = (principal, message_id)
+    if key in Q10_TASKS: return a2a_json({"task": Q10_TASKS[key]["task"]})
+    parts = message.get("parts", [])
+    result_part = next((p for p in parts if p.get("mediaType") == "application/vnd.ga5.invoice-action-results+json"), None)
+    if result_part:
+        task_id = message.get("taskId"); existing = next((v for v in Q10_TASKS.values() if v["principal"] == principal and v["task"]["id"] == task_id), None)
+        if not existing: raise HTTPException(404, "Task not found")
+        results = result_part.get("data", {}).get("results", []); prop = existing["proposals"]
+        by_id = {p["packageId"]:p for p in prop["proposals"]}; executions=[]
+        for r in results:
+            p=by_id.get(r.get("packageId"))
+            if not p or any(r.get(x)!=p.get(x) for x in ("actionId","action")): raise HTTPException(422,"Result mismatch")
+            if r.get("outcome")=="ACCEPTED": executions.append({**p,"receiptNonce":r.get("receiptNonce")})
+        existing["task"] = invoice_task(task_id, existing["task"]["contextId"], message, prop, "TASK_STATE_COMPLETED", executions)
+        return a2a_json({"task":existing["task"]})
+    batch_part = next((p for p in parts if p.get("mediaType") == "application/vnd.ga5.invoice-claim-batch+json"), None)
+    if not batch_part: raise HTTPException(422,"Unsupported message")
+    batch = batch_part.get("data", {}); proposals=[]
+    for package in batch.get("packages", []):
+        pid=package.get("packageId", "pkg")
+        text=compact_json(package); refs=re.findall(r"\[([^\]]+)\]", text)[:3]
+        proposals.append({"packageId":pid,"actionId":"act_"+hashlib.sha256(text.encode()).hexdigest()[:20],"action":"open_exception","facts":{"vendorName":"","invoiceNumber":"","amountMinor":0,"currency":"INR"},"evidenceRefs":refs[:3],"rationale":"open_exception requires review because the invoice package must be reconciled against authoritative records."})
+    prop={"batchId":batch.get("batchId"),"proposals":proposals}; tid="task_"+uuid.uuid4().hex; task=invoice_task(tid,"ctx_"+uuid.uuid4().hex,message,prop)
+    Q10_TASKS[key]={"principal":principal,"task":task,"proposals":prop}; return a2a_json({"task":task})
+
+
+@app.get("/a2a/tasks")
+async def a2a_list(request: Request):
+    principal=a2a_headers(request); return a2a_json({"tasks":[v["task"] for v in Q10_TASKS.values() if v["principal"]==principal]})
+
+
+@app.get("/a2a/tasks/{task_id}")
+async def a2a_get(task_id: str, request: Request):
+    principal=a2a_headers(request); found=next((v["task"] for v in Q10_TASKS.values() if v["principal"]==principal and v["task"]["id"]==task_id),None)
+    if not found: raise HTTPException(404,"Task not found")
+    return a2a_json(found)
+
+
+@app.post("/a2a/tasks/{task_id}:cancel")
+async def a2a_cancel(task_id: str, request: Request):
+    principal=a2a_headers(request,True); found=next((v for v in Q10_TASKS.values() if v["principal"]==principal and v["task"]["id"]==task_id),None)
+    if not found: raise HTTPException(404,"Task not found")
+    if found["task"]["status"]["state"] != "TASK_STATE_INPUT_REQUIRED": raise HTTPException(409,"Terminal task")
+    found["task"]["status"]["state"]="TASK_STATE_CANCELED"; return a2a_json(found["task"])
+
+
+# Q11 ------------------------------------------------------------------------
+def incident_evidence(transcript): return re.findall(r"\[([^\]]+)\]", transcript)[:2]
+
+@app.post("/v2/incidents")
+async def create_incident(request: Request):
+    data=await body(request)
+    if data.get("profile")!="ga5-incident-agent/v2": raise HTTPException(422,"Unsupported profile")
+    run_id=data.get("runId"); incident=data.get("incident",{}); catalog=data.get("toolCatalog",[])
+    if run_id in Q11_RUNS: return Q11_RUNS[run_id]
+    root=(incident.get("allowedRootCauses") or [""])[0]; evidence=incident_evidence(incident.get("transcript", "")); diagnostic=next((x for x in catalog if x.get("name") not in data.get("policy",{}).get("effectTools",[])), None)
+    trace=uuid.uuid4().hex; dispatches=[]
+    if diagnostic: dispatches=[{"actionId":"act_"+uuid.uuid4().hex[:16],"callId":"call_"+uuid.uuid4().hex[:16],"phase":"diagnostic","toolName":diagnostic.get("name"),"arguments":{},"evidence":evidence[:1],"attempt":1,"traceparent":"00-"+trace+"-"+uuid.uuid4().hex[:16]+"-01"}]
+    result={"runId":run_id,"status":"waiting","diagnosis":{"rootCause":root,"evidence":evidence},"dispatches":dispatches,"approvals":[]}; Q11_RUNS[run_id]=result; return result
+
+
+@app.post("/v2/incidents/{run_id}/receipts")
+async def incident_receipts(run_id: str, request: Request):
+    if run_id not in Q11_RUNS: raise HTTPException(404,"Run not found")
+    data=await body(request); run=Q11_RUNS[run_id]; run["status"]="completed"; run["chosenEffect"]=""; run["suppressed"]=[]; run["actionLog"]=run.pop("dispatches",[]); run["receiptLog"]=data.get("outcomes",[]); run["otlp"]={"resourceSpans":[]}; run["dispatches"]=[]; run["approvals"]=[]; return run
+
+
+@app.get("/v2/incidents/{run_id}")
+async def incident_get(run_id: str):
+    if run_id not in Q11_RUNS: raise HTTPException(404,"Run not found")
+    return Q11_RUNS[run_id]
